@@ -209,15 +209,16 @@ def _cone_error(cur: np.ndarray, target: np.ndarray, tol_deg: float) -> np.ndarr
 
 
 def _solve_ik(env, arm: str, tip_target, target_z=None, across_axis=None, tilt_tol_deg: float = 35.0,
-              iters: int = 400, damping: float = 0.05, restarts: int = 4, seed: int = 0):
+              hold_jaw=None, iters: int = 400, damping: float = 0.05, restarts: int = 4, seed: int = 0):
     """Damped-least-squares IK on this arm's 6 joints, best of a few restarts.
 
     ``tip_target`` is the grasp point (finger-pad centre). ``target_z`` keeps the pointing
     direction within ``tilt_tol_deg`` of that vector (a cone, not an exact
     direction: this arm cannot point straight down over much of the table).
     ``across_axis`` turns the jaw-closing axis perpendicular to that vector (a
-    bottle's long axis) with the smallest rotation. Returns (joint targets,
-    fingertip position error in metres)."""
+    bottle's long axis) with the smallest rotation; ``hold_jaw`` instead keeps
+    the jaw axis along that world vector (no wrist twist while carrying).
+    Returns (joint targets, grasp-point position error in metres)."""
     m = env.model
     d = mujoco.MjData(m)
     sid = _site(env, arm)
@@ -250,6 +251,8 @@ def _solve_ik(env, arm: str, tip_target, target_z=None, across_axis=None, tilt_t
                 perp = y - np.dot(y, across_axis) * across_axis
                 perp /= max(np.linalg.norm(perp), 1e-9)
                 rows.append(0.5 * np.cross(y, perp)); J.append(jacr[:, didx])
+            elif hold_jaw is not None:
+                rows.append(0.5 * np.cross(R[:, 1], hold_jaw)); J.append(jacr[:, didx])
             e = np.concatenate(rows); Jm = np.vstack(J)
             if np.linalg.norm(err) < 1e-3 and np.linalg.norm(e[3:]) < 1e-2:
                 break
@@ -272,15 +275,19 @@ def _solve_ik(env, arm: str, tip_target, target_z=None, across_axis=None, tilt_t
 
 def _plan_move(env, cmd) -> tuple[np.ndarray, dict]:
     """Resolve a Move into joint targets, falling back to looser orientation constraints if needed."""
-    target_z = POINTING.get(cmd.pointing)  # None for "keep"
+    if "," in cmd.pointing:
+        target_z = np.array([float(v) for v in cmd.pointing.split(",")]); target_z /= np.linalg.norm(target_z)
+    else:
+        target_z = POINTING.get(cmd.pointing)  # None for "keep"
     across = _bottle_long_axis(env, cmd.across)[0] if cmd.across else None
-    attempts = [(f"pointing within {cmd.tilt_tolerance_deg:.0f} deg + jaws across", target_z, across),
-                (f"pointing within {cmd.tilt_tolerance_deg:.0f} deg", target_z, None),
-                ("position only", None, None)]
-    for label, tz, ax in attempts:
-        if tz is None and ax is None and label != "position only":
-            continue
-        q, err = _solve_ik(env, cmd.arm, cmd.to, tz, ax, tilt_tol_deg=cmd.tilt_tolerance_deg)
+    # Without --across, keep the jaws where they are so a held object is not twisted out.
+    jaw_now = env.data.site_xmat[_site(env, cmd.arm)].reshape(3, 3)[:, 1].copy()
+    tol = f"pointing within {cmd.tilt_tolerance_deg:.0f} deg"
+    attempts = ([(f"{tol} + jaws across {cmd.across}", target_z, across, None)] if across is not None
+                else [(f"{tol} + jaws held", target_z, None, jaw_now)])
+    attempts += [(tol, target_z, None, None), ("position only", None, None, None)]
+    for label, tz, ax, hj in attempts:
+        q, err = _solve_ik(env, cmd.arm, cmd.to, tz, ax, tilt_tol_deg=cmd.tilt_tolerance_deg, hold_jaw=hj)
         if err < 0.02:
             info = {"ik_position_error_m": round(err, 4), "ik_constraints": label}
             if across is not None:
@@ -319,7 +326,7 @@ class Move:
     session: str
     arm: Literal["left", "right"]
     to: tuple[float, float, float]  # grasp-point target, world frame (table top is z=0.75)
-    pointing: Literal["down", "forward", "keep"] = "keep"
+    pointing: str = "keep"  # "down", "forward", "keep", or an explicit world vector "x,y,z" (e.g. "0.45,0,-0.89")
     across: str | None = None  # e.g. "bottle_3": turn the jaws to close across that bottle's long axis
     tilt_tolerance_deg: float = 35.0  # how far from the --pointing direction the gripper may tilt
     gripper: float | None = None  # 0 closed .. 1 open; None keeps the current opening
