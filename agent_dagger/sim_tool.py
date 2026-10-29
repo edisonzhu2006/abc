@@ -16,7 +16,8 @@ the scene, restores the saved state, does its work, and saves again.
 
 World frame: x forward (away from the robot bases, toward the back wall),
 y to the robot's left, z up. Table top is z = 0.75. ``move`` targets are the
-point between the fingertips. Actions are 14 joint targets: [left j1-j6,
+grasp point (centre of the finger pads, 6 cm from the wrist; the fingertips
+reach 9 cm further). Actions are 14 joint targets: [left j1-j6,
 left gripper, right j1-j6, right gripper], radians, gripper 0 = closed,
 1 = open, one action per 1/30 s.
 """
@@ -44,6 +45,7 @@ GRIPPER_IDX = {"left": 6, "right": 13}
 TCP_SITE = {"left": "left_tcp_site", "right": "right_tcp_site"}
 POINTING = {"down": np.array([0.0, 0.0, -1.0]), "forward": np.array([1.0, 0.0, 0.0])}
 FINGERTIP_OFFSET = 0.153  # fingertips lie this far past the tcp site along its pointing (+z) axis
+GRASP_OFFSET = 0.06  # the finger pads' centre lies this far past the tcp site: the point that should meet an object
 FINGER_MAX_OPENING = 0.095  # metres between the jaws at gripper = 1
 ARM_REACH = 0.62  # rough radius (m) from an arm's base within which top-down targets are reachable
 
@@ -140,9 +142,11 @@ def _describe(env, meta) -> dict:
     for arm in ("left", "right"):
         sid = _site(env, arm)
         R = d.site_xmat[sid].reshape(3, 3)
+        grasp = d.site_xpos[sid] + GRASP_OFFSET * R[:, 2]
         tip = d.site_xpos[sid] + FINGERTIP_OFFSET * R[:, 2]
         base = d.xpos[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, f"{arm}_link_1")]
-        arms[arm] = {"fingertip_xyz": _r3(tip),
+        arms[arm] = {"grasp_point_xyz": _r3(grasp),
+                     "fingertip_xyz": _r3(tip),
                      "pointing": [round(float(v), 2) for v in R[:, 2]],
                      "jaw_axis": [round(float(v), 2) for v in R[:, 1]],
                      "gripper_open": round(float(state[GRIPPER_IDX[arm]]), 2),
@@ -156,9 +160,11 @@ def _describe(env, meta) -> dict:
                 "inner_radius_m": round(float(result["bin_radius_top"]), 3)},
         "bottles": bottles,
         "arms": arms,
-        "notes": [f"table top z=0.75; each arm reaches roughly {ARM_REACH} m from its base_xy with the gripper pointing down",
-                  f"jaws open to {FINGER_MAX_OPENING} m; bottles are ~0.06-0.07 m across, so grasp with the jaw_axis across the bottle's long_axis (use --across)",
-                  "fingertip_xyz is the point between the fingertips; --to targets refer to it"],
+        "notes": [f"table top z=0.75; each arm reaches roughly {ARM_REACH} m from its base_xy",
+                  "--to targets refer to grasp_point_xyz (the finger pads' centre); the fingertips extend ~0.09 m further along 'pointing'",
+                  "to grasp a bottle lying on the table: move the grasp point to the bottle's centre_xyz raised by ~0.07 m, gripper open, "
+                  "pointing down with --across <bottle>, then close (gripper 0) and lift; a closed jaw_gap_m of ~0.05-0.06 means a bottle is held",
+                  f"jaws open to {FINGER_MAX_OPENING} m; bottles are ~0.06-0.07 m across"],
         "state_14": _r3(state),
     }
 
@@ -192,15 +198,28 @@ def _interpolate(start: np.ndarray, goal: np.ndarray, steps: int) -> np.ndarray:
     return start[None, :] + (goal - start)[None, :] * s
 
 
-def _solve_ik(env, arm: str, tip_target, target_z=None, target_y=None, iters: int = 400, damping: float = 0.05):
-    """Damped-least-squares IK on this arm's 6 joints.
+def _cone_error(cur: np.ndarray, target: np.ndarray, tol_deg: float) -> np.ndarray:
+    """Rotation (small-angle vector) that brings ``cur`` to within ``tol_deg`` of ``target``; zero if already inside."""
+    axis = np.cross(cur, target)
+    s = np.linalg.norm(axis)
+    angle = np.arctan2(s, np.dot(cur, target))
+    if angle <= np.radians(tol_deg) or s < 1e-9:
+        return np.zeros(3)
+    return axis / s * (angle - np.radians(tol_deg))
 
-    ``tip_target`` is the fingertip point. ``target_z`` (pointing direction) and
-    ``target_y`` (jaw-closing direction) constrain the orientation when given.
-    Returns (joint targets, fingertip position error in metres)."""
+
+def _solve_ik(env, arm: str, tip_target, target_z=None, across_axis=None, tilt_tol_deg: float = 35.0,
+              iters: int = 400, damping: float = 0.05, restarts: int = 4, seed: int = 0):
+    """Damped-least-squares IK on this arm's 6 joints, best of a few restarts.
+
+    ``tip_target`` is the grasp point (finger-pad centre). ``target_z`` keeps the pointing
+    direction within ``tilt_tol_deg`` of that vector (a cone, not an exact
+    direction: this arm cannot point straight down over much of the table).
+    ``across_axis`` turns the jaw-closing axis perpendicular to that vector (a
+    bottle's long axis) with the smallest rotation. Returns (joint targets,
+    fingertip position error in metres)."""
     m = env.model
     d = mujoco.MjData(m)
-    d.qpos[:] = env.data.qpos
     sid = _site(env, arm)
     qidx = np.array(env._qpos_indices)[ARM_SLICES[arm]]
     jids = [next(j for j in range(m.njnt) if m.jnt_qposadr[j] == q) for q in qidx]
@@ -208,52 +227,72 @@ def _solve_ik(env, arm: str, tip_target, target_z=None, target_y=None, iters: in
     lo, hi = m.jnt_range[jids, 0], m.jnt_range[jids, 1]
     jacp, jacr = np.zeros((3, m.nv)), np.zeros((3, m.nv))
     tip_target = np.asarray(tip_target, float)
-    for _ in range(iters):
-        mujoco.mj_kinematics(m, d); mujoco.mj_comPos(m, d)
+    rng = np.random.default_rng(seed)
+    best_q, best_err = None, np.inf
+    for restart in range(restarts):
+        d.qpos[:] = env.data.qpos
+        if restart > 0:
+            d.qpos[qidx] = rng.uniform(lo, hi)
+        for _ in range(iters):
+            mujoco.mj_kinematics(m, d); mujoco.mj_comPos(m, d)
+            R = d.site_xmat[sid].reshape(3, 3)
+            tip = d.site_xpos[sid] + GRASP_OFFSET * R[:, 2]
+            err = tip_target - tip
+            mujoco.mj_jacSite(m, d, jacp, jacr, sid)
+            # Grasp-point jacobian = site jacobian + rotation effect on the offset lever arm.
+            lever = GRASP_OFFSET * R[:, 2]
+            jtip = jacp[:, didx] - np.cross(lever[None, :], jacr[:, didx].T).T
+            rows, J = [err], [jtip]
+            if target_z is not None:
+                rows.append(0.5 * _cone_error(R[:, 2], np.asarray(target_z, float), tilt_tol_deg)); J.append(jacr[:, didx])
+            if across_axis is not None:
+                y = R[:, 1]
+                perp = y - np.dot(y, across_axis) * across_axis
+                perp /= max(np.linalg.norm(perp), 1e-9)
+                rows.append(0.5 * np.cross(y, perp)); J.append(jacr[:, didx])
+            e = np.concatenate(rows); Jm = np.vstack(J)
+            if np.linalg.norm(err) < 1e-3 and np.linalg.norm(e[3:]) < 1e-2:
+                break
+            dq = Jm.T @ np.linalg.solve(Jm @ Jm.T + damping**2 * np.eye(len(e)), e)
+            d.qpos[qidx] = np.clip(d.qpos[qidx] + np.clip(dq, -0.2, 0.2), lo, hi)
+        mujoco.mj_kinematics(m, d)
         R = d.site_xmat[sid].reshape(3, 3)
-        tip = d.site_xpos[sid] + FINGERTIP_OFFSET * R[:, 2]
-        err = tip_target - tip
-        mujoco.mj_jacSite(m, d, jacp, jacr, sid)
-        # Fingertip jacobian = site jacobian + rotation effect on the offset lever arm.
-        lever = FINGERTIP_OFFSET * R[:, 2]
-        jtip = jacp[:, didx] - np.cross(lever[None, :], jacr[:, didx].T).T
-        rows, J = [err], [jtip]
-        if target_z is not None:
-            rows.append(0.5 * np.cross(R[:, 2], target_z)); J.append(jacr[:, didx])
-        if target_y is not None:
-            rows.append(0.5 * np.cross(R[:, 1], target_y)); J.append(jacr[:, didx])
-        e = np.concatenate(rows); Jm = np.vstack(J)
-        if np.linalg.norm(err) < 1e-3 and np.linalg.norm(e[3:]) < 1e-2:
+        pos_err = float(np.linalg.norm(tip_target - (d.site_xpos[sid] + GRASP_OFFSET * R[:, 2])))
+        ori_err = float(np.linalg.norm(np.concatenate(rows[1:]))) if len(rows) > 1 else 0.0
+        # Prefer the solution nearest the current pose: a random restart must be
+        # clearly better to win, so nearby targets get consistent, predictable poses.
+        joint_dist = float(np.linalg.norm(d.qpos[qidx] - env.data.qpos[qidx]))
+        score = pos_err + 0.05 * ori_err + 0.01 * joint_dist
+        if score < best_err:
+            best_q, best_err, best_pos = d.qpos[qidx].copy(), score, pos_err
+        if best_pos < 2e-3 and ori_err < 1e-2:
             break
-        dq = Jm.T @ np.linalg.solve(Jm @ Jm.T + damping**2 * np.eye(len(e)), e)
-        d.qpos[qidx] = np.clip(d.qpos[qidx] + np.clip(dq, -0.2, 0.2), lo, hi)
-    mujoco.mj_kinematics(m, d)
-    R = d.site_xmat[sid].reshape(3, 3)
-    return d.qpos[qidx].copy(), float(np.linalg.norm(tip_target - (d.site_xpos[sid] + FINGERTIP_OFFSET * R[:, 2])))
+    return best_q, best_pos
 
 
 def _plan_move(env, cmd) -> tuple[np.ndarray, dict]:
     """Resolve a Move into joint targets, falling back to looser orientation constraints if needed."""
-    sid = _site(env, cmd.arm)
-    R = env.data.site_xmat[sid].reshape(3, 3)
     target_z = POINTING.get(cmd.pointing)  # None for "keep"
-    target_y = None
-    if cmd.across:
-        axis, _ = _bottle_long_axis(env, cmd.across)
-        z = target_z if target_z is not None else R[:, 2]
-        y = np.cross(z, axis)
-        if np.linalg.norm(y) < 1e-3:
-            y = R[:, 1]
-        target_y = y / np.linalg.norm(y)
-        if np.dot(target_y, R[:, 1]) < 0:  # pick the jaw direction closest to the current one (symmetric grasp)
-            target_y = -target_y
-    attempts = [("pointing+jaws", target_z, target_y), ("pointing only", target_z, None), ("position only", None, None)]
-    for label, tz, ty in attempts:
-        q, err = _solve_ik(env, cmd.arm, cmd.to, tz, ty)
+    across = _bottle_long_axis(env, cmd.across)[0] if cmd.across else None
+    attempts = [(f"pointing within {cmd.tilt_tolerance_deg:.0f} deg + jaws across", target_z, across),
+                (f"pointing within {cmd.tilt_tolerance_deg:.0f} deg", target_z, None),
+                ("position only", None, None)]
+    for label, tz, ax in attempts:
+        if tz is None and ax is None and label != "position only":
+            continue
+        q, err = _solve_ik(env, cmd.arm, cmd.to, tz, ax, tilt_tol_deg=cmd.tilt_tolerance_deg)
         if err < 0.02:
-            return q, {"ik_position_error_m": round(err, 4), "ik_constraints": label}
+            info = {"ik_position_error_m": round(err, 4), "ik_constraints": label}
+            if across is not None:
+                # Jaw axis vs bottle axis at the solved pose: 90 deg = jaws exactly across the bottle.
+                d2 = mujoco.MjData(env.model); d2.qpos[:] = env.data.qpos
+                d2.qpos[np.array(env._qpos_indices)[ARM_SLICES[cmd.arm]]] = q
+                mujoco.mj_kinematics(env.model, d2)
+                jaw = d2.site_xmat[_site(env, cmd.arm)].reshape(3, 3)[:, 1]
+                info["jaw_to_bottle_deg"] = round(float(np.degrees(np.arccos(abs(np.dot(jaw, across))))), 1)
+            return q, info
     return q, {"ik_position_error_m": round(err, 4), "ik_constraints": "position only",
-               "warning": f"fingertip target unreachable for the {cmd.arm} arm (closest approach {err:.2f} m); try the other arm or a nearer point"}
+               "warning": f"grasp-point target unreachable for the {cmd.arm} arm (closest approach {err:.2f} m); try the other arm or a nearer point"}
 
 
 # ---------------------------------------------------------------- commands
@@ -276,12 +315,13 @@ class Observe:
 
 @dataclass
 class Move:
-    """Move one gripper so its fingertips reach a world xyz target over --steps actions (IK -> joint targets)."""
+    """Move one gripper so its grasp point (finger-pad centre) reaches a world xyz target over --steps actions (IK -> joint targets)."""
     session: str
     arm: Literal["left", "right"]
-    to: tuple[float, float, float]  # fingertip target, world frame (table top is z=0.75)
+    to: tuple[float, float, float]  # grasp-point target, world frame (table top is z=0.75)
     pointing: Literal["down", "forward", "keep"] = "keep"
     across: str | None = None  # e.g. "bottle_3": turn the jaws to close across that bottle's long axis
+    tilt_tolerance_deg: float = 35.0  # how far from the --pointing direction the gripper may tilt
     gripper: float | None = None  # 0 closed .. 1 open; None keeps the current opening
     steps: int = 30
 
