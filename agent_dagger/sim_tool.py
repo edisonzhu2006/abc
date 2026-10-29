@@ -150,6 +150,7 @@ def _describe(env, meta) -> dict:
                      "pointing": [round(float(v), 2) for v in R[:, 2]],
                      "jaw_axis": [round(float(v), 2) for v in R[:, 1]],
                      "gripper_open": round(float(state[GRIPPER_IDX[arm]]), 2),
+                     "gripper_cmd": round(float(meta.get("gripper_cmd", {}).get(arm, state[GRIPPER_IDX[arm]])), 2),
                      "jaw_gap_m": round(float(state[GRIPPER_IDX[arm]]) * FINGER_MAX_OPENING, 3),
                      "base_xy": _r3(base[:2]),
                      "joints_rad": _r3(state[ARM_SLICES[arm]])}
@@ -179,9 +180,22 @@ def _render(env, session: Path, step: int) -> str:
 
 # ---------------------------------------------------------------- acting
 
+def _commanded_start(env, meta: dict) -> np.ndarray:
+    """Current joint state, but with the grippers at their last *commanded* values.
+
+    After closing on an object the measured opening is wider than the command
+    (the fingers stop at the object); re-commanding the measured value would
+    drop the squeeze force and release it."""
+    start = env.get_state().copy()
+    for arm, idx in GRIPPER_IDX.items():
+        start[idx] = meta.get("gripper_cmd", {}).get(arm, start[idx])
+    return start
+
+
 def _apply(env, session: Path, meta: dict, targets: np.ndarray, source: str) -> dict:
     """Step the sim through a (N, 14) sequence of joint targets, recording (s, a)."""
     states, actions = [], []
+    meta["gripper_cmd"] = {arm: float(targets[-1][idx]) for arm, idx in GRIPPER_IDX.items()}
     for a in targets:
         states.append(env.get_state().copy()); actions.append(np.asarray(a, np.float32))
         env.step(np.asarray(a, np.float32), render_obs=False)
@@ -283,8 +297,20 @@ def _plan_move(env, cmd) -> tuple[np.ndarray, dict]:
     # Without --across, keep the jaws where they are so a held object is not twisted out.
     jaw_now = env.data.site_xmat[_site(env, cmd.arm)].reshape(3, 3)[:, 1].copy()
     tol = f"pointing within {cmd.tilt_tolerance_deg:.0f} deg"
-    attempts = ([(f"{tol} + jaws across {cmd.across}", target_z, across, None)] if across is not None
-                else [(f"{tol} + jaws held", target_z, None, jaw_now)])
+    if across is not None and abs(cmd.jaw_angle_deg - 90.0) > 0.5:
+        # Oblique grasp: aim the jaw axis at the requested angle to the bottle, in the
+        # plane perpendicular to the pointing direction (nearest of the two mirror options).
+        z = target_z if target_z is not None else env.data.site_xmat[_site(env, cmd.arm)].reshape(3, 3)[:, 2]
+        perp = np.cross(z, across); perp /= max(np.linalg.norm(perp), 1e-9)
+        along = across - np.dot(across, z) * z; along /= max(np.linalg.norm(along), 1e-9)
+        th = np.radians(cmd.jaw_angle_deg)
+        candidates = [s1 * np.sin(th) * perp + s2 * np.cos(th) * along for s1 in (1, -1) for s2 in (1, -1)]
+        jaw_target = max(candidates, key=lambda v: np.dot(v, jaw_now))
+        attempts = [(f"{tol} + jaws at {cmd.jaw_angle_deg:.0f} deg to {cmd.across}", target_z, None, jaw_target)]
+    elif across is not None:
+        attempts = [(f"{tol} + jaws across {cmd.across}", target_z, across, None)]
+    else:
+        attempts = [(f"{tol} + jaws held", target_z, None, jaw_now)]
     attempts += [(tol, target_z, None, None), ("position only", None, None, None)]
     for label, tz, ax, hj in attempts:
         q, err = _solve_ik(env, cmd.arm, cmd.to, tz, ax, tilt_tol_deg=cmd.tilt_tolerance_deg, hold_jaw=hj)
@@ -328,6 +354,7 @@ class Move:
     to: tuple[float, float, float]  # grasp-point target, world frame (table top is z=0.75)
     pointing: str = "keep"  # "down", "forward", "keep", or an explicit world vector "x,y,z" (e.g. "0.45,0,-0.89")
     across: str | None = None  # e.g. "bottle_3": turn the jaws to close across that bottle's long axis
+    jaw_angle_deg: float = 90.0  # with --across: angle between the jaw-closing axis and the bottle's long axis (90 = straight across)
     tilt_tolerance_deg: float = 35.0  # how far from the --pointing direction the gripper may tilt
     gripper: float | None = None  # 0 closed .. 1 open; None keeps the current opening
     steps: int = 30
@@ -363,6 +390,7 @@ def main(cmd) -> None:
             old.unlink()
         env, _ = make_scene(TASK, cmd.scene, cmd.seed)
         meta = {"scene": cmd.scene, "seed": cmd.seed, "step": 0, "history": []}
+        last = env.get_state()
         if cmd.from_recording:
             rec = np.load(cmd.from_recording)
             n = int(cmd.at_chunk * 15)
@@ -370,6 +398,9 @@ def main(cmd) -> None:
                 env.step(a, render_obs=False)
             meta["step"] = n
             meta["replayed_from"] = cmd.from_recording
+            if n:
+                last = rec["actions"][n - 1]
+        meta["gripper_cmd"] = {arm: float(last[idx]) for arm, idx in GRIPPER_IDX.items()}
         _save_state(env, session, meta["step"])
         (session / "session.json").write_text(json.dumps(meta))
         report = _describe(env, meta)
@@ -389,7 +420,7 @@ def main(cmd) -> None:
             report = _describe(env, meta); report["image"] = _render(env, session, meta["step"])
         else:
             meta["history"].append(meta["step"])
-            start = env.get_state().copy()
+            start = _commanded_start(env, meta)
             if isinstance(cmd, Hold):
                 targets = np.tile(start, (cmd.steps, 1)); source = "agent:hold"; extra = {}
             elif isinstance(cmd, Joints):
