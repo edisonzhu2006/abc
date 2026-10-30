@@ -43,8 +43,12 @@ class Config:
     seed: int = 6
     chunks: int = 120  # 60 s of robot time
     check_every: int = 2  # monitor cadence in chunks (2 = every 1 s of robot time)
-    monitor: Literal["stall", "external"] = "stall"
+    monitor: Literal["stall", "external", "gemini"] = "stall"
     patience: int = 10  # stall monitor: chunks (0.5 s each) without a new bottle in the bin
+    corrector: Literal["external", "gemini"] = "external"  # external = an agent you spawn works the session; gemini = in-process
+    gemini_model: str = "gemini-3.5-flash"
+    gemini_min_interval_s: float = 12.5  # free tier: 5 requests/min; 0 on a billed key
+    corrector_max_calls: int = 25
     wait_minutes: float = 30.0  # how long to wait for a corrector handback / external decision
     checkpoint: str = "cache/abc_dit_xl_200k_model.pt"
     prompt: str = "sim throw plastic bottles in bin"
@@ -80,7 +84,11 @@ def main(cfg: Config) -> None:
 
     print(f"loading {cfg.checkpoint} on {cfg.device}...", flush=True)
     policy = DiTInferencePolicy(Path(cfg.checkpoint), SimEvalConfig(checkpoint=cfg.checkpoint, prompt=cfg.prompt), device=cfg.device)
-    monitor = make_monitor(cfg.monitor if cfg.monitor == "stall" else "stall", cfg.patience)  # stall also backs "external" as ground truth
+    monitor = make_monitor("stall", cfg.patience)  # ground-truth stand-in; also the reference when an agent decides
+    gemini_last_call, gemini_history = 0.0, []
+    if cfg.monitor == "gemini" or cfg.corrector == "gemini":
+        import gemini_agent
+        gemini_agent.load_key()
     env, obs = make_scene(TASK, cfg.scene, cfg.seed)
     m, d = env.model, env.data
 
@@ -124,8 +132,20 @@ def main(cfg: Config) -> None:
                 continue
             ctx = MonitorContext(chunk=chunk, images={c: obs["images"][c] for c in CAMERAS}, state=obs["state"],
                                  prompt=cfg.prompt, task_eval=result)
-            truth = monitor(ctx)  # ground-truth stand-in (also the reference when an external agent decides)
-            if cfg.monitor == "external":
+            truth = monitor(ctx)  # ground-truth stand-in (also the reference when an agent decides)
+            if cfg.monitor == "gemini":
+                wait = cfg.gemini_min_interval_s - (time.time() - gemini_last_call)
+                if wait > 0:
+                    time.sleep(wait)
+                hist = ("Previous checks: " + "; ".join(gemini_history[-3:])) if gemini_history else ""
+                try:
+                    gemini_last_call = time.time()
+                    dec = gemini_agent.gemini_monitor(_frame(env), cfg.prompt, chunk * 0.5, hist, model=cfg.gemini_model)
+                    intervene, reason = bool(dec["intervene"]), f"{dec.get('failure_mode', '')}: {dec.get('reason', '')}"
+                except Exception as e:  # rate limit or transient error: fall back to ground truth for this check
+                    intervene, reason = truth.intervene, f"(gemini error {type(e).__name__}; used stall truth) {truth.reason}"
+                gemini_history.append(f"t={chunk * 0.5:.0f}s {'INTERVENE' if intervene else 'ok'}")
+            elif cfg.monitor == "external":
                 n_checks += 1
                 img = _render(env, session, meta["step"])
                 (session / f"check_request_{n_checks:03d}.json").write_text(json.dumps(
@@ -152,8 +172,18 @@ def main(cfg: Config) -> None:
                  "scene": _describe(env, meta)}, indent=1))
             t0 = time.time()
             handed = None
+            if cfg.corrector == "gemini":
+                # In-process corrector: it works the same session files, then we reload below.
+                summary = gemini_agent.run_corrector(session, reason, model=cfg.gemini_model, max_calls=cfg.corrector_max_calls,
+                                                     min_interval_s=cfg.gemini_min_interval_s)
+                cur = json.loads((session / "session.json").read_text())
+                if cur.get("handed_back_at") is None:  # ran out of calls without handing back: resume anyway
+                    cur["handed_back_at"] = cur["step"]
+                    _log(session, {"cmd": "handback", "step": cur["step"], "note": "(forced: corrector hit its call budget)"})
+                    (session / "session.json").write_text(json.dumps(cur))
+                handed = cur
             deadline = time.time() + cfg.wait_minutes * 60
-            while time.time() < deadline:
+            while handed is None and time.time() < deadline:
                 try:
                     cur = json.loads((session / "session.json").read_text())
                 except json.JSONDecodeError:
