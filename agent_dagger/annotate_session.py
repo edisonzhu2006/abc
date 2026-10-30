@@ -106,7 +106,7 @@ def main(cfg: Config) -> None:
         span = next((s for s in spans if s["start"] <= step < s["end"]), None) if agent_phase else None
         result = env.evaluate_task().to_info(squeeze=True)
         y = img.height + 6
-        phase = "AGENT INTERVENTION (EEF commands -> IK -> joints)" if agent_phase else ("POLICY (resumed after handback)" if step >= n_policy else "POLICY")
+        phase = "AGENT INTERVENTION (EEF commands -> IK -> joints)" if agent_phase else ("HANDED BACK - policy resumes from here" if step >= n_policy else "POLICY")
         draw.text((8, y), f"t = {step / 30:5.1f} s   {phase}   |   sim truth: {result['num_bottles_in_bin']}/{result['num_active_bottles']} in bin",
                   fill=(255, 90, 90) if agent_phase else (120, 230, 120), font=font)
         y += 26
