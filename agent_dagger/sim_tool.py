@@ -57,6 +57,9 @@ def _load_session(session: Path):
     env, _ = make_scene(TASK, meta["scene"], meta["seed"])
     snap = np.load(session / f"state_{meta['step']:04d}.npz")["state"]
     mujoco.mj_setState(env.model, env.data, snap, STATE_SPEC)
+    # Refresh kinematics: _plan_move reads bottle axes / the current jaw axis from
+    # xmat/geom_xpos/site_xmat, which otherwise still hold the scene's initial placement.
+    mujoco.mj_forward(env.model, env.data)
     return env, meta
 
 
@@ -448,8 +451,17 @@ def run_grasp(env, session: Path, meta: dict, arm: str, bottle: str, note: str =
     centre, _, _ = _bottle_geometry(env, bottle)
     lean = _lean_for(env, bottle)
     cx, cy = float(centre[0]), float(centre[1])
+    cur = _describe(env, meta)["arms"][arm]["grasp_point_xyz"]
+    if cur[2] < 1.0:
+        # Start every grasp from a consistent raised pose: approaching from a low, tilted
+        # leftover pose (e.g. right after a failed grasp) makes the descent sag and miss.
+        run_move(env, session, meta, arm=arm, to=(cur[0], cur[1], 1.05), tilt_tolerance_deg=25.0, gripper=1.0, steps=25,
+                 note=f"[grasp {bottle}] raise before approaching")
     r = run_move(env, session, meta, arm=arm, to=(cx, cy, 0.95), pointing=lean, tilt_tolerance_deg=8.0, across=bottle, gripper=1.0, steps=35,
                  note=f"[grasp {bottle}] pre-grasp above the bottle, jaws across it. {note}")
+    if r.get("ik_position_error_m", 0) > 0.02:
+        r["grasp"] = {"held": False, "why": f"{bottle} is out of reach for the {arm} arm (pre-grasp error {r['ik_position_error_m']} m); use the other arm or move the bottle"}
+        return r
     gp = np.array(r["arms"][arm]["grasp_point_xyz"]); centre, _, _ = _bottle_geometry(env, bottle)
     off = centre[:2] - gp[:2]  # xy miss at the pre-grasp; only compensate a clear one
     if np.linalg.norm(off) < 0.015:
@@ -479,6 +491,15 @@ def run_place(env, session: Path, meta: dict, arm: str, note: str = "") -> dict:
     """Raise, carry high over the bin centre, release, settle, back out with the gripper open."""
     d0 = _describe(env, meta)
     gp = d0["arms"][arm]["grasp_point_xyz"]; bx, by, _ = d0["bin"]["xyz"]
+    if d0["arms"][arm]["jaw_gap_m"] < 0.02 or d0["arms"][arm]["gripper_cmd"] > 0.5:
+        return {**d0, "place": {"bottles_in_bin": d0["bottles_in_bin"], "error": f"the {arm} gripper is not holding anything; grasp first"}}
+    # Reach check before moving anything: can this arm get its grasp point over the bin at carry height?
+    probe = Move(session=str(session), arm=arm, to=(bx, by, 1.13), tilt_tolerance_deg=20.0)
+    _, info = _plan_move(env, probe)
+    if info.get("ik_position_error_m", 0) > 0.02:
+        return {**d0, "place": {"bottles_in_bin": d0["bottles_in_bin"],
+                                "error": f"the bin is out of reach for the {arm} arm (closest approach {info['ik_position_error_m']} m); "
+                                         "hand the bottle off: set it down around (0.52, -0.08) and pick it up with the other arm"}}
     run_move(env, session, meta, arm=arm, to=(gp[0], gp[1], 1.13), tilt_tolerance_deg=15.0, steps=30, note=f"[place] raise to carry height. {note}")
     run_move(env, session, meta, arm=arm, to=(bx, by, 1.13), tilt_tolerance_deg=20.0, steps=90, note="[place] carry high over the bin centre")
     run_move(env, session, meta, arm=arm, to=(bx, by, 1.13), tilt_tolerance_deg=20.0, gripper=1.0, steps=10, note="[place] release")

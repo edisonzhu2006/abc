@@ -150,7 +150,8 @@ def _compact(report: dict) -> dict:
     return r
 
 
-def run_corrector(session: Path, reason: str, model: str = DEFAULT_MODEL, max_calls: int = 40, thinking: str = "high") -> dict:
+def run_corrector(session: Path, reason: str, model: str = DEFAULT_MODEL, max_calls: int = 40, thinking: str = "high",
+                  min_interval_s: float = 12.5) -> dict:
     from google import genai
     from google.genai import types
 
@@ -207,8 +208,30 @@ def run_corrector(session: Path, reason: str, model: str = DEFAULT_MODEL, max_ca
                _png_part(img)]
     calls, done, t0 = 0, False, time.time()
     summary = {"start_in_bin": first["bottles_in_bin"], "calls": 0}
+    last_request = 0.0
     while not done and calls < max_calls:
-        resp = chat.send_message(message)
+        # Free-tier pacing (5 requests/min) plus retry on 429 with the server's suggested delay.
+        wait = min_interval_s - (time.time() - last_request)
+        if wait > 0:
+            time.sleep(wait)
+        for attempt in range(6):
+            try:
+                last_request = time.time()
+                resp = chat.send_message(message)
+                break
+            except Exception as e:  # google.genai ClientError 429 / ServerError 503
+                msg = str(e)
+                if "429" in msg or "503" in msg:
+                    import re
+                    m_ = re.search(r"retry in (\d+(?:\.\d+)?)s", msg) or re.search(r"retryDelay': '(\d+)s", msg)
+                    delay = min(float(m_.group(1)) + 1 if m_ else 20.0 * (attempt + 1), 120.0)
+                    print(f"  rate limited; waiting {delay:.0f}s", flush=True)
+                    time.sleep(delay)
+                    continue
+                raise
+        else:
+            print("giving up: repeated rate limits", flush=True)
+            break
         thoughts = [p.text for p in (resp.candidates[0].content.parts or []) if getattr(p, "thought", False) and p.text]
         fcs = [p.function_call for p in (resp.candidates[0].content.parts or []) if p.function_call]
         texts = [p.text for p in (resp.candidates[0].content.parts or []) if p.text and not getattr(p, "thought", False)]
@@ -253,6 +276,7 @@ class Correct:
     model: str = DEFAULT_MODEL
     max_calls: int = 40
     thinking: str = "high"
+    min_interval_s: float = 12.5  # free tier allows 5 requests/min; set 0 on a billed key
 
 
 @dataclass
@@ -266,7 +290,7 @@ class Monitor:
 
 def main(cmd) -> None:
     if isinstance(cmd, Correct):
-        run_corrector(Path(cmd.session), cmd.reason, cmd.model, cmd.max_calls, cmd.thinking)
+        run_corrector(Path(cmd.session), cmd.reason, cmd.model, cmd.max_calls, cmd.thinking, cmd.min_interval_s)
     else:
         print(json.dumps(gemini_monitor(cmd.image, cmd.prompt, cmd.chunk * 0.5, model=cmd.model), indent=1))
 
