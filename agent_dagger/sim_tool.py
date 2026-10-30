@@ -358,6 +358,7 @@ class Move:
     tilt_tolerance_deg: float = 35.0  # how far from the --pointing direction the gripper may tilt
     gripper: float | None = None  # 0 closed .. 1 open; None keeps the current opening
     steps: int = 30
+    note: str = ""  # why you are doing this (recorded with the action, shown in replays)
 
 
 @dataclass
@@ -366,6 +367,7 @@ class Joints:
     session: str
     targets: tuple[float, ...]
     steps: int = 30
+    note: str = ""  # why you are doing this (recorded with the action, shown in replays)
 
 
 @dataclass
@@ -373,12 +375,20 @@ class Hold:
     """Hold the current pose for --steps actions (lets objects settle or a grasp close)."""
     session: str
     steps: int = 15
+    note: str = ""  # why you are doing this (recorded with the action, shown in replays)
 
 
 @dataclass
 class Undo:
     """Return to the state before the last command (the recorded actions are kept, marked undone)."""
     session: str
+
+
+@dataclass
+class Handback:
+    """End the intervention and return control to the policy, stating why."""
+    session: str
+    note: str = ""
 
 
 def main(cmd) -> None:
@@ -405,6 +415,13 @@ def main(cmd) -> None:
         (session / "session.json").write_text(json.dumps(meta))
         report = _describe(env, meta)
         report["image"] = _render(env, session, meta["step"])
+    elif isinstance(cmd, Handback):
+        meta = json.loads((session / "session.json").read_text())
+        meta["handed_back_at"] = meta["step"]
+        (session / "session.json").write_text(json.dumps(meta))
+        _log(session, {"cmd": "handback", "step": meta["step"], "note": cmd.note})
+        env, meta = _load_session(session)
+        report = _describe(env, meta); report["handed_back"] = True
     elif isinstance(cmd, Undo):
         meta = json.loads((session / "session.json").read_text())
         if not meta["history"]:
@@ -444,4 +461,4 @@ def main(cmd) -> None:
 
 
 if __name__ == "__main__":
-    main(tyro.cli(Init | Observe | Move | Joints | Hold | Undo))
+    main(tyro.cli(Init | Observe | Move | Joints | Hold | Undo | Handback))

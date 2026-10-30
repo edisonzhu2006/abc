@@ -67,9 +67,28 @@ with the grasp point about 7-9 cm above the bottle's centre.
 If a bottle is out of reach for both arms, pushing it toward the table's
 centre first (open gripper, low sweep) is a legitimate correction.
 
+## Record your reasoning
+
+Give every `move`, `hold` and `joints` command a `--note "..."` saying what
+you are trying to do and why (one sentence: which bottle, what you saw, what
+you expect). The notes are shown next to the replay video and are how your
+decisions get reviewed.
+
+## Hand control back
+
+You are an intervention, not the whole episode. Your job is to fix the
+failure the monitor flagged and return control to the learned policy as soon
+as it can plausibly continue on its own - typically once the stuck bottle is
+in the bin, or once it has been moved to a spot the policy can handle (clear
+of the arms, on the table, in reach). When that point comes, run
+`handback --note "..."` stating why the policy can continue, and stop. Also
+hand back (with a note explaining the limit) if you have spent 30 commands
+without progress. Do not keep going to finish every bottle yourself.
+
 ## Finish
 
-Stop when every reachable bottle is in the bin, or after 40 commands. Then
-reply with: bottles in bin at start and end, the sequence of moves per bottle
-in one line each, anything that failed and how you recovered, and the session
-directory (its `actions.npz` holds the recorded (state, action) pairs).
+After the handback (or if you hit 40 commands), reply with: bottles in bin at
+start and at handback, the sequence of moves per bottle in one line each,
+anything that failed and how you recovered, why you handed back when you did,
+and the session directory (its `actions.npz` holds the recorded (state,
+action) pairs).
