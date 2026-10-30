@@ -28,7 +28,7 @@ import mujoco
 import numpy as np
 import tyro
 
-from sim_tool import (STATE_SPEC, _describe, _load_session, _log, _render, run_grasp, run_hold, run_move, run_place)
+from sim_tool import (STATE_SPEC, _describe, _load_session, _log, _render, run_grasp, run_hold, run_move, run_move_both, run_place)
 from unseen_rollouts import CAMERAS
 
 # gemini-4-argon and the 3.x pro models need a billed project (free-tier quota is 0);
@@ -102,7 +102,8 @@ the arm that cannot reach the bin can be handed off: set it down around (0.52, -
 Tools act on the live simulation and return the scene report plus a fresh camera image. Prefer the macros:
 grasp(arm, bottle) does pre-grasp, hover check, descend, close, verify and lift; place(arm) carries high over the bin,
 releases and backs the arm out. Use move for anything else (parking an arm, nudging a bottle, routing around the bin:
-never sweep an arm through the bin's column while a bottle stands in it). After each tool result, check what actually
+never sweep an arm through the bin's column while a bottle stands in it). move_both moves the two arms at the same
+time (e.g. park one while the other approaches, or coordinate a hand-off). After each tool result, check what actually
 happened (jaw_gap_m ~0.05 means a bottle is held; 0.0 means the jaws closed on nothing; bottles_in_bin is the score).
 
 Give every tool call a one-sentence note: which bottle, what you saw, what you expect. When the flagged failure is fixed
@@ -133,6 +134,12 @@ def _tools():
                                       "gripper": {"type": "NUMBER", "description": "1 = open, 0 = closed; omit to keep the current command"},
                                       "tilt_tolerance_deg": num, "steps": {"type": "INTEGER"}, "note": {"type": "STRING"}},
                                       "required": ["arm", "x", "y", "z", "note"]}),
+        types.FunctionDeclaration(name="move_both", description="Move both arms at the same time: a grasp-point target for each arm, executed together.",
+                                  parameters={"type": "OBJECT", "properties": {
+                                      "left_x": num, "left_y": num, "left_z": num, "right_x": num, "right_y": num, "right_z": num,
+                                      "left_pointing": {"type": "STRING"}, "right_pointing": {"type": "STRING"},
+                                      "left_gripper": num, "right_gripper": num, "steps": {"type": "INTEGER"}, "note": {"type": "STRING"}},
+                                      "required": ["left_x", "left_y", "left_z", "right_x", "right_y", "right_z", "note"]}),
         types.FunctionDeclaration(name="hold", description="Hold the current targets for `steps` actions.",
                                   parameters={"type": "OBJECT", "properties": {"steps": {"type": "INTEGER"}, "note": {"type": "STRING"}}, "required": ["note"]}),
         types.FunctionDeclaration(name="undo", description="Return to the state before the last command.",
@@ -177,6 +184,17 @@ def run_corrector(session: Path, reason: str, model: str = DEFAULT_MODEL, max_ca
             if args.get("gripper") is not None:
                 kw["gripper"] = float(args["gripper"])
             return run_move(env, session, meta, **kw), False
+        if name == "move_both":
+            kw = dict(left_to=(float(args["left_x"]), float(args["left_y"]), float(args["left_z"])),
+                      right_to=(float(args["right_x"]), float(args["right_y"]), float(args["right_z"])),
+                      left_pointing=args.get("left_pointing") or "keep", right_pointing=args.get("right_pointing") or "keep",
+                      note=args.get("note", ""))
+            for k in ("left_gripper", "right_gripper"):
+                if args.get(k) is not None:
+                    kw[k] = float(args[k])
+            if args.get("steps"):
+                kw["steps"] = int(args["steps"])
+            return run_move_both(env, session, meta, **kw), False
         if name == "hold":
             return run_hold(env, session, meta, int(args.get("steps", 15)), args.get("note", "")), False
         if name == "undo":

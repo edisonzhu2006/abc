@@ -395,6 +395,21 @@ class Handback:
 
 
 @dataclass
+class MoveBoth:
+    """Move both arms at once: a grasp-point target for each, executed together over --steps actions."""
+    session: str
+    left_to: tuple[float, float, float]
+    right_to: tuple[float, float, float]
+    left_pointing: str = "keep"
+    right_pointing: str = "keep"
+    left_gripper: float | None = None
+    right_gripper: float | None = None
+    tilt_tolerance_deg: float = 25.0
+    steps: int = 40
+    note: str = ""
+
+
+@dataclass
 class Grasp:
     """Macro: pick up a lying bottle with one arm (pre-grasp, hover check, descend, close, verify, lift)."""
     session: str
@@ -432,6 +447,28 @@ def run_move(env, session: Path, meta: dict, **kw) -> dict:
     report = _apply(env, session, meta, _interpolate(start, goal, cmd.steps), f"agent:move_{cmd.arm}")
     report.update(extra)
     _log(session, {"cmd": "move", "args": {k: v for k, v in vars(cmd).items() if k != "session"}, "step": meta["step"], **extra})
+    return report
+
+
+def run_move_both(env, session: Path, meta: dict, left_to, right_to, left_pointing="keep", right_pointing="keep",
+                  left_gripper=None, right_gripper=None, tilt_tolerance_deg=25.0, steps=40, note="") -> dict:
+    """Both arms move together: independent IK per arm, one joint interpolation for all 14 targets."""
+    meta["history"].append(meta["step"])
+    start = _commanded_start(env, meta)
+    goal = start.copy(); extra = {}
+    for arm, to, pointing, grip in (("left", left_to, left_pointing, left_gripper), ("right", right_to, right_pointing, right_gripper)):
+        q, info = _plan_move(env, Move(session=str(session), arm=arm, to=tuple(to), pointing=pointing, tilt_tolerance_deg=tilt_tolerance_deg))
+        goal[ARM_SLICES[arm]] = q
+        if grip is not None:
+            goal[GRIPPER_IDX[arm]] = float(np.clip(grip, 0, 1))
+        extra[f"{arm}_ik_error_m"] = info["ik_position_error_m"]; extra[f"{arm}_ik_constraints"] = info["ik_constraints"]
+        if "warning" in info:
+            extra[f"{arm}_warning"] = info["warning"]
+    report = _apply(env, session, meta, _interpolate(start, goal, steps), "agent:move_both")
+    report.update(extra)
+    _log(session, {"cmd": "move_both", "args": {"left_to": list(left_to), "right_to": list(right_to), "left_pointing": left_pointing,
+                                                 "right_pointing": right_pointing, "left_gripper": left_gripper, "right_gripper": right_gripper,
+                                                 "steps": steps, "note": note}, "step": meta["step"], **extra})
     return report
 
 
@@ -542,12 +579,15 @@ def main(cmd) -> None:
         _log(session, {"cmd": "handback", "step": meta["step"], "note": cmd.note})
         env, meta = _load_session(session)
         report = _describe(env, meta); report["handed_back"] = True
-    elif isinstance(cmd, (Grasp, Place)):
+    elif isinstance(cmd, (Grasp, Place, MoveBoth)):
         env, meta = _load_session(session)
         if isinstance(cmd, Grasp):
             report = run_grasp(env, session, meta, cmd.arm, cmd.bottle, cmd.note)
-        else:
+        elif isinstance(cmd, Place):
             report = run_place(env, session, meta, cmd.arm, cmd.note)
+        else:
+            report = run_move_both(env, session, meta, cmd.left_to, cmd.right_to, cmd.left_pointing, cmd.right_pointing,
+                                   cmd.left_gripper, cmd.right_gripper, cmd.tilt_tolerance_deg, cmd.steps, cmd.note)
         if "error" not in report:
             report["image"] = _render(env, session, meta["step"])
     elif isinstance(cmd, Undo):
@@ -589,4 +629,4 @@ def main(cmd) -> None:
 
 
 if __name__ == "__main__":
-    main(tyro.cli(Init | Observe | Move | Joints | Hold | Undo | Handback | Grasp | Place))
+    main(tyro.cli(Init | Observe | Move | MoveBoth | Joints | Hold | Undo | Handback | Grasp | Place))
