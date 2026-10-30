@@ -116,9 +116,11 @@ def main(cfg: Config) -> None:
                 sid = _site(env, span["arm"]); R = d.site_xmat[sid].reshape(3, 3)
                 gp = d.site_xpos[sid] + GRASP_OFFSET * R[:, 2]
                 gap = float(env.get_state()[GRIPPER_IDX[span["arm"]]]) * 0.095
-                draw.text((8, y), f"{span['arm']} EEF now: grasp point ({gp[0]:.3f}, {gp[1]:.3f}, {gp[2]:.3f})  jaw gap {gap:.3f} m  "
-                                  f"joint targets this step: {np.round(action[0:7] if span['arm'] == 'left' else action[7:14], 2).tolist()}",
-                          fill=(200, 200, 255), font=small); y += 22
+                joints = action[0:7] if span["arm"] == "left" else action[7:14]
+                draw.text((8, y), f"{span['arm']} EEF now: grasp point ({gp[0]:.3f}, {gp[1]:.3f}, {gp[2]:.3f})   jaw gap {gap:.3f} m",
+                          fill=(200, 200, 255), font=small); y += 20
+                draw.text((8, y), "joint targets this step (IK output): " + "  ".join(f"{float(v):+.2f}" for v in joints),
+                          fill=(170, 170, 230), font=small); y += 22
             if span["note"]:
                 for line in textwrap.wrap("why: " + span["note"], width=int(img.width / 9)):
                     draw.text((8, y), line, fill=(255, 230, 150), font=small); y += 19

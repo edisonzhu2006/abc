@@ -49,23 +49,32 @@ assume. The fingertips reach 9 cm past the grasp point and the hand bottoms
 out when the pads touch the table, so a lying bottle is gripped from above
 with the grasp point about 7-9 cm above the bottle's centre.
 
-1. pre-grasp: `move --arm A --to CX CY 0.95 --pointing 0.45,0,-0.89
+1. pre-grasp: `move --arm A --to CX CY 0.95 --pointing PX,PY,-0.89
    --tilt-tolerance-deg 8 --across bottle_N --gripper 1 --steps 35`
-   (CX CY = the bottle's `centre_xyz`)
-2. descend: same but `--to CX CY 0.84 --steps 25`
-3. close: same target with `--gripper 0 --steps 15`, then `hold --steps 15`;
-   check jaw_gap_m is ~0.05
-4. lift: `move --arm A --to CX CY 1.0 --pointing 0.45,0,-0.89
-   --tilt-tolerance-deg 10 --steps 30`; check the bottle's centre_xyz rose
-5. raise and carry: `--to CX CY 1.13` then `--to BX BY 1.13
+   (CX CY = the bottle's `centre_xyz`). Lean the pointing along the bottle's
+   own long axis: a bottle lying along x takes `0.45,0,-0.89`; one along y
+   takes `0,0.45,-0.89` or `0,-0.45,-0.89` (tilted toward its far end); for
+   a diagonal bottle scale its `long_axis` x/y by 0.45.
+2. hover and check: `--to CX CY 0.92`, then compare the report's grasp point
+   with the bottle centre and correct any xy offset in the next step.
+3. descend: `--to CX CY 0.865 --steps 25` (the hand bottoms out about here).
+4. close: same target with `--gripper 0 --steps 15`, then `hold --steps 15`;
+   check jaw_gap_m is ~0.05 (0.0 = missed: lift slightly, correct xy, retry).
+5. lift: `move --arm A --to CX CY 1.0 --tilt-tolerance-deg 10 --steps 30`
+   (same --pointing); check the bottle's centre_xyz rose.
+6. raise and carry: `--to CX CY 1.13` then `--to BX BY 1.13
    --tilt-tolerance-deg 20 --steps 90` (BX BY = `bin.xyz`). Carry high: the
    bottle hangs ~10 cm below the grasp point and the bin rim is at
-   `bin.opening_z`; a low carry pushes the bin across the table.
-6. release: same target with `--gripper 1 --steps 10`, then `hold --steps 45`;
+   `bin.opening_z`; a low carry pushes the bin across the table. Never sweep
+   an arm through the bin's column while a bottle stands in it; route up
+   (z 1.25) and around.
+7. release: same target with `--gripper 1 --steps 10`, then `hold --steps 45`;
    check `bottles_in_bin`.
 
-If a bottle is out of reach for both arms, pushing it toward the table's
-centre first (open gripper, low sweep) is a legitimate correction.
+If a bottle is only reachable by the left arm, a hand-off works: the left arm
+sets it down where both arms reach (around x 0.52, y -0.08) and the right arm
+picks it up from there. If a bottle is out of reach for both arms, pushing it
+toward the table's centre (open gripper, low sweep) is a legitimate correction.
 
 ## Record your reasoning
 
