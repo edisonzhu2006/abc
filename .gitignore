@@ -15,3 +15,9 @@ wandb/
 # Robot recordings, review videos, and exports (deploy/).
 data/
 .python-version
+
+# secrets (never commit)
+.env
+*.env
+*.key
+*_key.txt

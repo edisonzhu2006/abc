@@ -391,6 +391,105 @@ class Handback:
     note: str = ""
 
 
+@dataclass
+class Grasp:
+    """Macro: pick up a lying bottle with one arm (pre-grasp, hover check, descend, close, verify, lift)."""
+    session: str
+    arm: Literal["left", "right"]
+    bottle: str  # e.g. bottle_3
+    note: str = ""
+
+
+@dataclass
+class Place:
+    """Macro: carry a held bottle high over the bin, release it, and back the arm out (gripper open)."""
+    session: str
+    arm: Literal["left", "right"]
+    note: str = ""
+
+
+# ---------------------------------------------------------------- macros (shared by the CLI and in-process agents)
+
+def _lean_for(env, bottle: str) -> str:
+    """Pointing vector leaning along the bottle's long axis (toward its far end), as an 'x,y,z' string."""
+    axis, _ = _bottle_long_axis(env, bottle)
+    h = np.array([axis[0], axis[1], 0.0])
+    h = h / max(np.linalg.norm(h), 1e-9)
+    return f"{0.45 * h[0]:.3f},{0.45 * h[1]:.3f},-0.89"
+
+
+def run_move(env, session: Path, meta: dict, **kw) -> dict:
+    cmd = Move(session=str(session), **kw)
+    meta["history"].append(meta["step"])
+    start = _commanded_start(env, meta)
+    q, extra = _plan_move(env, cmd)
+    goal = start.copy(); goal[ARM_SLICES[cmd.arm]] = q
+    if cmd.gripper is not None:
+        goal[GRIPPER_IDX[cmd.arm]] = float(np.clip(cmd.gripper, 0, 1))
+    report = _apply(env, session, meta, _interpolate(start, goal, cmd.steps), f"agent:move_{cmd.arm}")
+    report.update(extra)
+    _log(session, {"cmd": "move", "args": {k: v for k, v in vars(cmd).items() if k != "session"}, "step": meta["step"], **extra})
+    return report
+
+
+def run_hold(env, session: Path, meta: dict, steps: int = 15, note: str = "") -> dict:
+    meta["history"].append(meta["step"])
+    start = _commanded_start(env, meta)
+    report = _apply(env, session, meta, np.tile(start, (steps, 1)), "agent:hold")
+    _log(session, {"cmd": "hold", "args": {"steps": steps, "note": note}, "step": meta["step"]})
+    return report
+
+
+def run_grasp(env, session: Path, meta: dict, arm: str, bottle: str, note: str = "") -> dict:
+    """Pre-grasp, hover-check, descend, close, verify, lift. Returns the final report with a 'grasp' summary."""
+    names = [b["name"] for b in _describe(env, meta)["bottles"]]
+    if bottle not in names:
+        return {"error": f"unknown bottle {bottle!r}; scene has {names}"}
+    centre, _, _ = _bottle_geometry(env, bottle)
+    lean = _lean_for(env, bottle)
+    cx, cy = float(centre[0]), float(centre[1])
+    r = run_move(env, session, meta, arm=arm, to=(cx, cy, 0.95), pointing=lean, tilt_tolerance_deg=8.0, across=bottle, gripper=1.0, steps=35,
+                 note=f"[grasp {bottle}] pre-grasp above the bottle, jaws across it. {note}")
+    gp = np.array(r["arms"][arm]["grasp_point_xyz"]); centre, _, _ = _bottle_geometry(env, bottle)
+    off = centre[:2] - gp[:2]  # xy miss at the pre-grasp; only compensate a clear one
+    if np.linalg.norm(off) < 0.015:
+        off = np.zeros(2)
+    tx, ty = float(centre[0] + off[0]), float(centre[1] + off[1])
+    # Descend straight from the pre-grasp (an intermediate hover leaves the arm in a pose that
+    # sags and tilts on the way down). Target 0.84: the hand bottoms out near 0.86, the height
+    # the policy's own grasps use.
+    run_move(env, session, meta, arm=arm, to=(tx, ty, 0.84), pointing=lean, tilt_tolerance_deg=8.0, across=bottle, gripper=1.0, steps=25,
+             note=f"[grasp {bottle}] descend (xy offset compensation {off.round(3).tolist()})")
+    run_move(env, session, meta, arm=arm, to=(tx, ty, 0.84), pointing=lean, tilt_tolerance_deg=8.0, across=bottle, gripper=0.0, steps=15,
+             note=f"[grasp {bottle}] close")
+    r = run_hold(env, session, meta, 15, note=f"[grasp {bottle}] settle the grip")
+    gap = r["arms"][arm]["jaw_gap_m"]
+    if gap < 0.02:
+        r["grasp"] = {"held": False, "jaw_gap_m": gap, "why": "jaws closed on nothing"}
+        return r
+    z0 = float(_bottle_geometry(env, bottle)[0][2])
+    r = run_move(env, session, meta, arm=arm, to=(tx, ty, 1.0), pointing=lean, tilt_tolerance_deg=10.0, steps=30,
+                 note=f"[grasp {bottle}] lift")
+    z1 = float(_bottle_geometry(env, bottle)[0][2])
+    r["grasp"] = {"held": z1 - z0 > 0.05, "jaw_gap_m": r["arms"][arm]["jaw_gap_m"], "bottle_rise_m": round(z1 - z0, 3)}
+    return r
+
+
+def run_place(env, session: Path, meta: dict, arm: str, note: str = "") -> dict:
+    """Raise, carry high over the bin centre, release, settle, back out with the gripper open."""
+    d0 = _describe(env, meta)
+    gp = d0["arms"][arm]["grasp_point_xyz"]; bx, by, _ = d0["bin"]["xyz"]
+    run_move(env, session, meta, arm=arm, to=(gp[0], gp[1], 1.13), tilt_tolerance_deg=15.0, steps=30, note=f"[place] raise to carry height. {note}")
+    run_move(env, session, meta, arm=arm, to=(bx, by, 1.13), tilt_tolerance_deg=20.0, steps=90, note="[place] carry high over the bin centre")
+    run_move(env, session, meta, arm=arm, to=(bx, by, 1.13), tilt_tolerance_deg=20.0, gripper=1.0, steps=10, note="[place] release")
+    r = run_hold(env, session, meta, 45, note="[place] let the bottle settle")
+    side = -0.33 if arm == "right" else 0.33
+    r = run_move(env, session, meta, arm=arm, to=(0.45, side, 1.12), tilt_tolerance_deg=25.0, gripper=1.0, steps=40,
+                 note="[place] back out of the bin column toward the base, open")
+    r["place"] = {"bottles_in_bin": r["bottles_in_bin"]}
+    return r
+
+
 def main(cmd) -> None:
     session = Path(cmd.session)
     t0 = time.time()
@@ -422,6 +521,14 @@ def main(cmd) -> None:
         _log(session, {"cmd": "handback", "step": meta["step"], "note": cmd.note})
         env, meta = _load_session(session)
         report = _describe(env, meta); report["handed_back"] = True
+    elif isinstance(cmd, (Grasp, Place)):
+        env, meta = _load_session(session)
+        if isinstance(cmd, Grasp):
+            report = run_grasp(env, session, meta, cmd.arm, cmd.bottle, cmd.note)
+        else:
+            report = run_place(env, session, meta, cmd.arm, cmd.note)
+        if "error" not in report:
+            report["image"] = _render(env, session, meta["step"])
     elif isinstance(cmd, Undo):
         meta = json.loads((session / "session.json").read_text())
         if not meta["history"]:
@@ -461,4 +568,4 @@ def main(cmd) -> None:
 
 
 if __name__ == "__main__":
-    main(tyro.cli(Init | Observe | Move | Joints | Hold | Undo | Handback))
+    main(tyro.cli(Init | Observe | Move | Joints | Hold | Undo | Handback | Grasp | Place))

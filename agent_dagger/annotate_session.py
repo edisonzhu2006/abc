@@ -79,14 +79,65 @@ def _surviving_commands(session: Path, agent_actions: np.ndarray, start_step: in
     return spans, (np.concatenate(rows) if rows else np.zeros((0, 14), np.float32)), (step if handback is not None else None)
 
 
+def _dagger_episode(session: Path, data) -> tuple[list[dict], np.ndarray, list[tuple[int, int]], list[dict]]:
+    """A dagger_collect.py episode: actions.npz is the whole trajectory in order
+    (policy and agent segments tagged by ``source``). Returns command spans
+    (agent commands and monitor flags, in step order), the actions, the agent
+    step intervals, and the monitor entries."""
+    actions, source = data["actions"], data["source"]
+    entries = [json.loads(l) for l in (session / "log.jsonl").read_text().splitlines()]
+    spans, monitors, prev = [], [], 0
+    agent_steps = {i for i, s in enumerate(source) if str(s).startswith("agent")}
+    for e in entries:
+        a = e.get("args", {})
+        if e["cmd"] == "monitor":
+            monitors.append(e)
+            if e["intervene"]:
+                spans.append({"start": e["step"], "end": e["step"], "text": f"MONITOR FLAG: {e['reason']}", "note": "", "arm": None})
+            prev = e["step"]
+            continue
+        if e["cmd"] == "handback":
+            spans.append({"start": e["step"], "end": e["step"], "text": "HANDBACK: " + e.get("note", ""), "note": "", "arm": None})
+            prev = e["step"]
+            continue
+        if e["cmd"] == "undo":
+            prev = e["step"]
+            continue
+        if e["cmd"] == "move":
+            text = (f"move {a['arm']} -> ({a['to'][0]:.2f}, {a['to'][1]:.2f}, {a['to'][2]:.2f})  pointing={a.get('pointing', 'keep')}"
+                    + (f"  across={a['across']}" if a.get("across") else "")
+                    + (f"  gripper={'closed' if a['gripper'] == 0 else 'open' if a['gripper'] == 1 else a['gripper']}" if a.get("gripper") is not None else ""))
+            arm = a["arm"]
+        else:
+            text, arm = f"{e['cmd']} {a.get('steps', '')}".strip(), None
+        spans.append({"start": prev, "end": e["step"], "text": text, "note": a.get("note", ""), "arm": arm})
+        prev = e["step"]
+    # agent intervals from the source tags
+    intervals, start = [], None
+    for i in range(len(source) + 1):
+        inside = i in agent_steps
+        if inside and start is None:
+            start = i
+        if not inside and start is not None:
+            intervals.append((start, i)); start = None
+    return spans, actions, intervals, monitors
+
+
 def main(cfg: Config) -> None:
     session = Path(cfg.session)
     meta = json.loads((session / "session.json").read_text())
-    rec = np.load(meta["replayed_from"]) if meta.get("replayed_from") else None
-    n_policy = int(meta["history"][0]) if meta.get("history") else 0
-    agent = np.load(session / "actions.npz")
-    spans, agent_rows, handback_step = _surviving_commands(session, agent["actions"], n_policy)
-    actions = np.concatenate([rec["actions"][:n_policy], agent_rows]) if rec is not None else agent_rows
+    data = np.load(session / "actions.npz")
+    is_dagger = (session / "config.json").exists() and "monitor" in json.loads((session / "config.json").read_text())
+    if is_dagger:
+        spans, actions, agent_intervals, monitors = _dagger_episode(session, data)
+        n_policy, handback_step = 0, None
+    else:
+        rec = np.load(meta["replayed_from"]) if meta.get("replayed_from") else None
+        n_policy = int(meta["history"][0]) if meta.get("history") else 0
+        spans, agent_rows, handback_step = _surviving_commands(session, data["actions"], n_policy)
+        actions = np.concatenate([rec["actions"][:n_policy], agent_rows]) if rec is not None else agent_rows
+        agent_intervals = [(n_policy, handback_step if handback_step is not None else len(actions))]
+        monitors = []
 
     env, obs = make_scene("put_plastic_bottles_in_bin", meta["scene"], meta["seed"])
     m, d = env.model, env.data
@@ -102,14 +153,20 @@ def main(cfg: Config) -> None:
         canvas = Image.new("RGB", (img.width, img.height + PANEL_H), "black")
         canvas.paste(img, (0, 0))
         draw = ImageDraw.Draw(canvas)
-        agent_phase = step >= n_policy and (handback_step is None or step < handback_step)
+        agent_phase = any(a <= step < b for a, b in agent_intervals)
+        just_handed_back = any(b <= step < b + 60 for _, b in agent_intervals)  # 2 s after each handback
         span = next((s for s in spans if s["start"] <= step < s["end"]), None) if agent_phase else None
+        marker = next((s for s in spans if s["start"] == s["end"] and s["start"] <= step < s["start"] + 45), None)  # flags/handbacks shown 1.5 s
         result = env.evaluate_task().to_info(squeeze=True)
         y = img.height + 6
-        phase = "AGENT INTERVENTION (EEF commands -> IK -> joints)" if agent_phase else ("HANDED BACK - policy resumes from here" if step >= n_policy else "POLICY")
+        n_int = sum(1 for a, _ in agent_intervals if a <= step)
+        phase = (f"AGENT INTERVENTION #{n_int} (EEF commands -> IK -> joints)" if agent_phase
+                 else "POLICY - resumed after handback" if just_handed_back else "POLICY")
         draw.text((8, y), f"t = {step / 30:5.1f} s   {phase}   |   sim truth: {result['num_bottles_in_bin']}/{result['num_active_bottles']} in bin",
                   fill=(255, 90, 90) if agent_phase else (120, 230, 120), font=font)
         y += 26
+        if marker is not None and not (span and span is marker):
+            draw.text((8, y), marker["text"][:150], fill=(255, 200, 80), font=font); y += 24
         if span is not None:
             draw.text((8, y), f"command: {span['text']}", fill="white", font=font); y += 24
             if span["arm"]:
