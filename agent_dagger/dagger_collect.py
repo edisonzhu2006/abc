@@ -49,6 +49,9 @@ class Config:
     gemini_model: str = "gemini-3.5-flash"
     gemini_min_interval_s: float = 12.5  # free tier: 5 requests/min; 0 on a billed key
     corrector_max_calls: int = 25
+    # What the policy is told its "previous actions" were when it resumes after a handback:
+    # the agent's last executed actions (continuity with the correction), or its current pose held.
+    resume_prefix: Literal["agent_actions", "hold_pose"] = "agent_actions"
     wait_minutes: float = 30.0  # how long to wait for a corrector handback / external decision
     checkpoint: str = "cache/abc_dit_xl_200k_model.pt"
     prompt: str = "sim throw plastic bottles in bin"
@@ -201,7 +204,14 @@ def main(cfg: Config) -> None:
             mujoco.mj_setState(m, d, snap, STATE_SPEC)
             mujoco.mj_forward(m, d)
             obs = env.get_obs()
-            prefix = np.tile(obs["state"], (cfg.prefix_length, 1))
+            if cfg.resume_prefix == "agent_actions":
+                # Seed the policy's action prefix with the corrector's last executed actions, so its
+                # first plan continues the correction rather than restarting from a standstill.
+                rec = np.load(session / "actions.npz")
+                prefix = np.asarray(rec["actions"][-cfg.prefix_length :], np.float32)
+                # Grippers: the agent commands 0/1 targets like the policy does, so these carry over as-is.
+            else:
+                prefix = np.tile(obs["state"], (cfg.prefix_length, 1))
             meta["phase"] = "policy"
             meta["interventions"].append({"n": n_int, "flag_chunk": chunk, "start_step": (session / "intervene_request.json").exists() and json.loads((session / "intervene_request.json").read_text())["step"],
                                           "end_step": meta["step"], "wall_s": round(time.time() - t0)})
