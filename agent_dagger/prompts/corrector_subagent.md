@@ -34,6 +34,12 @@ Read it when you want to see the scene).
   that bottle; `--gripper` 1 = open, 0 = closed (omit to keep the current
   command - a closed grip stays closed). Without `--across`, a move keeps the
   jaws' orientation, so carries do not twist a held object.
+- `move-both --left-to X Y Z --right-to X Y Z [--left-pointing P] [--right-pointing P]
+  [--left-gripper G] [--right-gripper G] [--steps N]` - move both arms at the
+  same time (park one while the other approaches, coordinate a hand-off).
+- `grasp --arm A --bottle bottle_N` / `place --arm A` - macros: a full pick
+  (pre-grasp, descend, close, verify, lift) or a full place (carry high over
+  the bin, release, back out); they refuse with advice when out of reach.
 - `hold --steps N` - keep the current targets (lets things settle).
 - `joints --targets <14 floats> --steps N` - raw joint targets if you prefer.
 - `undo` - return to the state before the last command.
