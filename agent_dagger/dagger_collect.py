@@ -45,6 +45,7 @@ class Config:
     check_every: int = 2  # monitor cadence in chunks (2 = every 1 s of robot time)
     monitor: Literal["stall", "external", "gemini"] = "stall"
     patience: int = 10  # stall monitor: chunks (0.5 s each) without a new bottle in the bin
+    grace_after_handback: int = 10  # extra chunks the policy gets after a handback before the monitor may flag again
     corrector: Literal["external", "gemini"] = "external"  # external = an agent you spawn works the session; gemini = in-process
     gemini_model: str = "gemini-3.5-flash"
     gemini_min_interval_s: float = 12.5  # free tier: 5 requests/min; 0 on a billed key
@@ -224,7 +225,9 @@ def main(cfg: Config) -> None:
             print(f"handback after {meta['interventions'][-1]['end_step'] - meta['interventions'][-1]['start_step']} agent steps; "
                   f"in_bin={result['num_bottles_in_bin']}/{result['num_active_bottles']}; policy resumes", flush=True)
             if hasattr(monitor, "_last_progress_chunk"):
-                monitor._last_progress_chunk = chunk
+                # Restart the stall clock and give the resumed policy a grace period: it needs a
+                # few seconds to settle into its own behaviour after someone else drove the arms.
+                monitor._last_progress_chunk = chunk + cfg.grace_after_handback
                 monitor._best = result["num_bottles_in_bin"]
     finally:
         video.close()
